@@ -30,11 +30,13 @@ pub struct ConvertOptions {
     pub image_link_prefix: String,
     /// 是否提取图片（false 时 Markdown 中不生成图片链接，默认 true）
     pub extract_images: bool,
+    /// 标题是否保留 Word 自动章节号（如 "# 1.1 文档目的"，默认 true；false 输出 "# 文档目的"）
+    pub heading_numbers: bool,
 }
 
 impl ConvertOptions {
     pub fn new() -> Self {
-        Self { keep_toc: false, image_link_prefix: String::new(), extract_images: true }
+        Self { keep_toc: false, image_link_prefix: String::new(), extract_images: true, heading_numbers: true }
     }
 }
 
@@ -439,6 +441,14 @@ fn para_numpr<'a>(p: &Node<'a, 'a>, styles: &Styles) -> (Option<String>, u32, Op
     (None, 0, sid)
 }
 
+/// 段落的直接大纲级别（w:outlineLvl，0 索引）。无标题样式但有大纲级别的段落可兜底为标题。
+fn para_outline_level(p: &Node) -> Option<u32> {
+    find_path(p, &["pPr", "outlineLvl"])
+        .and_then(|n| attr(&n, "val"))
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v <= 5) // 0-5 → 一至六级标题；9 表示正文
+}
+
 /// 表格 → Markdown 表格（单元格内的图片也会内联渲染）
 fn table_md(tbl: &Node, rels: &ImageRels, prefix: &str, extract_images: bool, used: &mut Vec<String>) -> String {
     let mut rows: Vec<Vec<String>> = Vec::new();
@@ -522,20 +532,27 @@ fn convert_doc(
                     }
                 }
 
-                if let Some(id) = &sid {
-                    if let Some(&level) = styles.headings.get(id) {
-                        // 标题：可能带自动编号（多级号）
-                        let prefix_num = match &num_id {
-                            Some(nid) => {
-                                let (is_bullet, numtext) = counters.resolve(nid, ilvl);
-                                if !is_bullet && !numtext.is_empty() { format!("{numtext} ") } else { String::new() }
+                // 标题判定：标题样式优先，w:outlineLvl 直接大纲级别兜底
+                let heading_level = sid.as_ref()
+                    .and_then(|id| styles.headings.get(id).copied())
+                    .or_else(|| para_outline_level(&el).map(|v| v + 1));
+
+                if let Some(level) = heading_level {
+                    // 标题：可能带自动编号（多级号）；计数器始终推进，是否展示由 heading_numbers 控制
+                    let prefix_num = match &num_id {
+                        Some(nid) => {
+                            let (is_bullet, numtext) = counters.resolve(nid, ilvl);
+                            if options.heading_numbers && !is_bullet && !numtext.is_empty() {
+                                format!("{numtext} ")
+                            } else {
+                                String::new()
                             }
-                            None => String::new(),
-                        };
-                        let hashes = "#".repeat(level.min(6) as usize);
-                        md.push_str(&format!("{hashes} {prefix_num}{text}\n\n"));
-                        continue;
-                    }
+                        }
+                        None => String::new(),
+                    };
+                    let hashes = "#".repeat(level.min(6) as usize);
+                    md.push_str(&format!("{hashes} {prefix_num}{text}\n\n"));
+                    continue;
                 }
 
                 match num_id {
@@ -755,6 +772,34 @@ mod tests {
         let body = p("纯文本，无图片");
         let r = convert(&body);
         assert!(r.images.is_empty(), "{:?}", r.images);
+    }
+
+    #[test]
+    fn outline_lvl_fallback_heading() {
+        // 无标题样式但有 w:outlineLvl 的段落兜底为标题
+        let body = r#"<w:p><w:pPr><w:outlineLvl w:val="1"/></w:pPr><w:r><w:t>直接格式化的节标题</w:t></w:r></w:p>"#;
+        let r = convert(body);
+        assert!(r.markdown.contains("## 直接格式化的节标题"), "{}", r.markdown);
+    }
+
+    #[test]
+    fn outline_lvl_body_text_not_heading() {
+        // outlineLvl=9 是正文，不应当成标题
+        let body = r#"<w:p><w:pPr><w:outlineLvl w:val="9"/></w:pPr><w:r><w:t>正文段落</w:t></w:r></w:p>"#;
+        let r = convert(body);
+        assert!(!r.markdown.contains('#'), "{}", r.markdown);
+    }
+
+    #[test]
+    fn heading_numbers_disabled() {
+        let body = format!("{}{}", p_style("简介", 3), p_style("文档目的", 4));
+        let r = convert_xml(&doc(&body), STYLES, NUMBERING, RELS, &ConvertOptions {
+            heading_numbers: false,
+            ..ConvertOptions::new()
+        }).unwrap();
+        assert!(r.markdown.contains("# 简介\n"), "{}", r.markdown);
+        assert!(r.markdown.contains("## 文档目的\n"), "{}", r.markdown);
+        assert!(!r.markdown.contains("# 1 简介"), "{}", r.markdown);
     }
 
     #[test]

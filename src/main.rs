@@ -25,6 +25,10 @@ struct Cli {
     #[arg(long)]
     no_images: bool,
 
+    /// 标题不保留 Word 自动章节号（如 "1.1"）
+    #[arg(long)]
+    no_heading_numbers: bool,
+
     /// 保留 TOC 目录段落（默认跳过）
     #[arg(long)]
     keep_toc: bool,
@@ -55,7 +59,12 @@ fn main() -> Result<()> {
         })
     };
 
-    let options = docx2md::ConvertOptions { keep_toc: cli.keep_toc, image_link_prefix, extract_images: !cli.no_images };
+    let options = docx2md::ConvertOptions {
+        keep_toc: cli.keep_toc,
+        image_link_prefix,
+        extract_images: !cli.no_images,
+        heading_numbers: !cli.no_heading_numbers,
+    };
     let result = docx2md::convert_file(&cli.input, &options)
         .with_context(|| format!("转换失败: {}", cli.input.display()))?;
 

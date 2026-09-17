@@ -115,11 +115,18 @@ struct Styles {
 /// rId → word/media/ 下的原始文件名（不含目录）
 type ImageRels = HashMap<String, String>;
 
+/// rId → 超链接 URL
+type LinkRels = HashMap<String, String>;
+
 /// 段落内联内容（文本与图片按文档顺序交错）
 #[derive(Debug)]
 enum Inline {
     Text(String),
     Image { r_id: String, alt: String },
+    /// 行内格式：加粗/斜体/删除线
+    Styled { bold: bool, italic: bool, strike: bool, children: Vec<Inline> },
+    /// 超链接：外部 URL 或文档内书签锚点
+    Link { target: Option<String>, anchor: Option<String>, children: Vec<Inline> },
 }
 
 // ---------------------------------------------------------------------------
@@ -210,11 +217,12 @@ fn parse_styles(xml: &str) -> Styles {
 }
 
 /// 解析 word/_rels/document.xml.rels。
-/// 返回 (rId → 原始文件名, 原始文件名 → zip 内路径)。
-fn parse_rels(xml: &str) -> (ImageRels, HashMap<String, String>) {
+/// 返回 (rId → 原始文件名, 原始文件名 → zip 内路径, rId → 超链接 URL)。
+fn parse_rels(xml: &str) -> (ImageRels, HashMap<String, String>, LinkRels) {
     let mut r_id_to_file: ImageRels = HashMap::new();
     let mut file_to_zip: HashMap<String, String> = HashMap::new();
-    let Ok(doc) = Document::parse(xml) else { return (r_id_to_file, file_to_zip) };
+    let mut links: LinkRels = HashMap::new();
+    let Ok(doc) = Document::parse(xml) else { return (r_id_to_file, file_to_zip, links) };
 
     // 同一 target 被多个 rId 引用时复用同一文件名
     let mut target_to_file: HashMap<String, String> = HashMap::new();
@@ -222,10 +230,15 @@ fn parse_rels(xml: &str) -> (ImageRels, HashMap<String, String>) {
 
     for rel in doc.descendants().filter(|n| tag(n) == "Relationship") {
         let rel_type = attr(&rel, "Type").unwrap_or("");
+        let (Some(id), Some(target)) = (attr(&rel, "Id"), attr(&rel, "Target")) else { continue };
+
+        if rel_type.ends_with("/hyperlink") {
+            links.insert(id.to_string(), target.to_string());
+            continue;
+        }
         if !rel_type.ends_with("/image") {
             continue;
         }
-        let (Some(id), Some(target)) = (attr(&rel, "Id"), attr(&rel, "Target")) else { continue };
 
         // 归一化为 zip 内路径："/word/media/x.png" 或相对 document.xml 的 "media/x.png"
         let zip_path = if let Some(stripped) = target.strip_prefix('/') {
@@ -249,7 +262,7 @@ fn parse_rels(xml: &str) -> (ImageRels, HashMap<String, String>) {
         file_to_zip.insert(file_name.clone(), zip_path);
         r_id_to_file.insert(id.to_string(), file_name.clone());
     }
-    (r_id_to_file, file_to_zip)
+    (r_id_to_file, file_to_zip, links)
 }
 
 // ---------------------------------------------------------------------------
@@ -348,71 +361,253 @@ fn to_roman(mut n: u32) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// 段落 / 表格提取（含图片）
+// 段落 / 表格提取（含图片、超链接、行内格式）
 // ---------------------------------------------------------------------------
 
-/// 段落内联内容：文本与图片按文档顺序交错。
-/// 图片引用支持 DrawingML（a:blip r:embed/r:link）与旧式 VML（v:imagedata r:id）。
-fn para_inlines(p: &Node) -> Vec<Inline> {
-    let mut out: Vec<Inline> = Vec::new();
-    let mut pending_alt = String::new();
-    for node in p.descendants() {
+/// 转换上下文：渲染时需要的只读引用集合
+struct Ctx<'a> {
+    images: &'a ImageRels,
+    links: &'a LinkRels,
+    image_prefix: &'a str,
+    extract_images: bool,
+    used_images: Vec<String>,
+}
+
+/// rPr 中的开/关属性（w:b、w:i 等）：存在且 val 不是 false/0/off 即为开
+fn is_on(el: Option<Node>) -> bool {
+    match el {
+        None => false,
+        Some(n) => !matches!(attr(&n, "val"), Some("false") | Some("0") | Some("off")),
+    }
+}
+
+/// 从 drawing/pict 容器中提取图片（docPr 的 descr/name 作为 alt）
+fn image_from_container(container: &Node) -> Option<Inline> {
+    let mut alt = String::new();
+    let mut r_id: Option<String> = None;
+    for node in container.descendants() {
         match tag(&node) {
-            "t" => {
-                let text = node.text().unwrap_or("");
-                if !text.is_empty() {
-                    out.push(Inline::Text(text.to_string()));
-                }
-            }
-            "tab" | "br" => out.push(Inline::Text(" ".into())),
-            // 每个 wp:inline / wp:anchor 容器对应一张图，进入时重置 alt
-            "inline" | "anchor" => pending_alt.clear(),
-            // wp:docPr 的 descr/name 作为 alt 文本
+            "inline" | "anchor" => alt.clear(),
             "docPr" => {
-                pending_alt = attr(&node, "descr").filter(|s| !s.is_empty())
+                alt = attr(&node, "descr").filter(|s| !s.is_empty())
                     .or_else(|| attr(&node, "name"))
                     .unwrap_or("").to_string();
             }
             "blip" => {
-                if let Some(r_id) = attr(&node, "embed").or_else(|| attr(&node, "link")) {
-                    out.push(Inline::Image { r_id: r_id.to_string(), alt: std::mem::take(&mut pending_alt) });
+                if r_id.is_none() {
+                    r_id = attr(&node, "embed").or_else(|| attr(&node, "link")).map(String::from);
                 }
             }
             "imagedata" => {
-                if let Some(r_id) = attr(&node, "id") {
-                    out.push(Inline::Image { r_id: r_id.to_string(), alt: std::mem::take(&mut pending_alt) });
+                if r_id.is_none() {
+                    r_id = attr(&node, "id").map(String::from);
                 }
             }
             _ => {}
         }
     }
+    r_id.map(|r_id| Inline::Image { r_id, alt })
+}
+
+/// 提取 run（w:r）内容：解析 rPr 行内格式 + 子内容
+fn run_inline(r: &Node) -> Vec<Inline> {
+    let mut bold = false;
+    let mut italic = false;
+    let mut strike = false;
+    let mut children: Vec<Inline> = Vec::new();
+
+    for child in r.children().filter(|n| n.is_element()) {
+        match tag(&child) {
+            "rPr" => {
+                bold = is_on(find_path(&child, &["b"]));
+                italic = is_on(find_path(&child, &["i"]));
+                strike = is_on(find_path(&child, &["strike"])) || is_on(find_path(&child, &["dstrike"]));
+            }
+            "t" => {
+                let text = child.text().unwrap_or("");
+                if !text.is_empty() {
+                    children.push(Inline::Text(text.to_string()));
+                }
+            }
+            "tab" | "br" | "cr" => children.push(Inline::Text(" ".into())),
+            "drawing" | "pict" => {
+                if let Some(img) = image_from_container(&child) {
+                    children.push(img);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if (bold || italic || strike) && !children.is_empty() {
+        vec![Inline::Styled { bold, italic, strike, children }]
+    } else {
+        children
+    }
+}
+
+/// 解析 fldSimple 的 HYPERLINK 域指令，提取 URL
+fn fld_simple_url(instr: &str) -> Option<String> {
+    if !instr.contains("HYPERLINK") {
+        return None;
+    }
+    // 形如 ` HYPERLINK "https://example.com" `
+    instr.split('"').nth(1).map(String::from)
+}
+
+/// 推入内联节点：相邻且格式相同的 Styled 自动合并，避免产生 `****` 这类断裂标记
+fn push_inline(out: &mut Vec<Inline>, item: Inline) {
+    if let Inline::Styled { bold, italic, strike, .. } = &item {
+        let (b, i, s) = (*bold, *italic, *strike);
+        if let Some(Inline::Styled { bold: pb, italic: pi, strike: ps, children: pc }) = out.last_mut() {
+            if *pb == b && *pi == i && *ps == s {
+                if let Inline::Styled { children, .. } = item {
+                    pc.extend(children);
+                }
+                return;
+            }
+        }
+    }
+    out.push(item);
+}
+
+/// 段落内联内容：递归遍历，支持超链接嵌套、行内格式、修订（接受插入/拒绝删除）、
+/// 复杂域代码超链接（fldChar/instrText）、mc:AlternateContent 只取 Choice 分支。
+fn walk_inlines<'a>(node: &Node<'a, 'a>, out: &mut Vec<Inline>) {
+    let mut fld_instr = String::new();          // 域指令累积（begin → separate 之间）
+    let mut fld_collecting = false;
+    let mut fld_display: Option<Vec<Inline>> = None; // separate → end 之间的显示内容
+
+    for child in node.children().filter(|n| n.is_element()) {
+        match tag(&child) {
+            "r" => {
+                // 复杂域代码状态机：fldChar begin/separate/end + instrText
+                let fld = find_path(&child, &["fldChar"]).and_then(|n| attr(&n, "fldCharType"));
+                match fld {
+                    Some("begin") => { fld_instr.clear(); fld_collecting = true; continue; }
+                    Some("separate") => { fld_collecting = false; fld_display = Some(Vec::new()); continue; }
+                    Some("end") => {
+                        if let Some(inner) = fld_display.take() {
+                            match fld_simple_url(&fld_instr) {
+                                Some(url) if !inner.is_empty() =>
+                                    push_inline(out, Inline::Link { target: Some(url), anchor: None, children: inner }),
+                                _ => { for it in inner { push_inline(out, it); } }
+                            }
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                if fld_collecting {
+                    if let Some(instr) = find_path(&child, &["instrText"]) {
+                        fld_instr.push_str(instr.text().unwrap_or(""));
+                    }
+                    continue;
+                }
+                let items = run_inline(&child);
+                if let Some(disp) = &mut fld_display {
+                    for it in items { push_inline(disp, it); }
+                } else {
+                    for it in items { push_inline(out, it); }
+                }
+            }
+            "hyperlink" => {
+                let mut inner = Vec::new();
+                walk_inlines(&child, &mut inner);
+                if !inner.is_empty() {
+                    let r_id = attr(&child, "id").map(String::from);
+                    let anchor = attr(&child, "anchor").map(String::from);
+                    push_inline(out, Inline::Link { target: r_id, anchor, children: inner });
+                }
+            }
+            "fldSimple" => {
+                // 旧式域代码超链接：<w:fldSimple w:instr=" HYPERLINK \"url\" ">
+                let url = attr(&child, "instr").and_then(fld_simple_url);
+                let mut inner = Vec::new();
+                walk_inlines(&child, &mut inner);
+                match url {
+                    Some(u) if !inner.is_empty() =>
+                        push_inline(out, Inline::Link { target: Some(u), anchor: None, children: inner }),
+                    _ => { for it in inner { push_inline(out, it); } }
+                }
+            }
+            // 修订：接受插入，拒绝删除
+            "ins" => walk_inlines(&child, out),
+            "del" | "moveFrom" => {}
+            // 结构化文档标签 / 智能标签：递归取内容
+            "sdt" | "sdtContent" | "smartTag" => walk_inlines(&child, out),
+            // AlternateContent：只取 Choice，跳过 Fallback（否则图片重复）
+            "AlternateContent" => {
+                if let Some(choice) = child.children().find(|n| tag(n) == "Choice") {
+                    walk_inlines(&choice, out);
+                }
+            }
+            "Fallback" => {}
+            // 图片容器直接出现在段落层（少数情况）
+            "drawing" | "pict" => {
+                if let Some(img) = image_from_container(&child) {
+                    push_inline(out, img);
+                }
+            }
+            _ => walk_inlines(&child, out),
+        }
+    }
+}
+
+/// 段落内联内容入口
+fn para_inlines(p: &Node) -> Vec<Inline> {
+    let mut out = Vec::new();
+    walk_inlines(p, &mut out);
     out
 }
 
-/// 渲染内联内容为 Markdown 文本（图片 → ![alt](prefix/file_name)）。
-/// 返回 (渲染文本, 本段引用到的文件名列表)。未在 rels 中解析到的图片被忽略。
-fn render_inlines(inlines: &[Inline], rels: &ImageRels, prefix: &str, extract_images: bool, used: &mut Vec<String>) -> String {
+/// 渲染内联内容为 Markdown 文本。
+/// 图片 → ![alt](prefix/file_name)；超链接 → [text](url)；格式 → **/* /~~。
+fn render_inlines(inlines: &[Inline], ctx: &mut Ctx) -> String {
     let mut text = String::new();
     for item in inlines {
         match item {
             Inline::Text(t) => text.push_str(t),
-            Inline::Image { r_id, alt } if extract_images => {
-                if let Some(file_name) = rels.get(r_id) {
-                    if !used.contains(file_name) {
-                        used.push(file_name.clone());
+            Inline::Image { r_id, alt } if ctx.extract_images => {
+                if let Some(file_name) = ctx.images.get(r_id) {
+                    if !ctx.used_images.contains(file_name) {
+                        ctx.used_images.push(file_name.clone());
                     }
-                    text.push_str(&format!("![{alt}]({prefix}{file_name})"));
+                    text.push_str(&format!("![{alt}]({}{file_name})", ctx.image_prefix));
                 }
             }
             Inline::Image { .. } => {}
+            Inline::Styled { bold, italic, strike, children } => {
+                let inner = render_inlines(children, ctx);
+                if inner.trim().is_empty() {
+                    continue;
+                }
+                let open = format!("{}{}{}", if *strike { "~~" } else { "" }, if *bold { "**" } else { "" }, if *italic { "*" } else { "" });
+                let close = format!("{}{}{}", if *italic { "*" } else { "" }, if *bold { "**" } else { "" }, if *strike { "~~" } else { "" });
+                text.push_str(&format!("{open}{inner}{close}"));
+            }
+            Inline::Link { target, anchor, children } => {
+                let inner = render_inlines(children, ctx);
+                if inner.trim().is_empty() {
+                    continue;
+                }
+                let url = target.as_ref().and_then(|id| ctx.links.get(id)).cloned()
+                    .or_else(|| target.clone().filter(|t| t.starts_with("http")))  // fldSimple 直接存 URL
+                    .map(String::from)
+                    .or_else(|| anchor.as_ref().map(|a| format!("#{a}")));
+                match url {
+                    Some(u) => text.push_str(&format!("[{inner}]({u})")),
+                    None => text.push_str(&inner),
+                }
+            }
         }
     }
-    text.trim().to_string()
+    text
 }
 
-/// 段落渲染文本（供纯文本场景使用，不含图片标记时也安全）
-fn para_text(p: &Node, rels: &ImageRels, prefix: &str, extract_images: bool, used: &mut Vec<String>) -> String {
-    render_inlines(&para_inlines(p), rels, prefix, extract_images, used)
+/// 段落渲染为 Markdown 文本（trim）
+fn para_text(p: &Node, ctx: &mut Ctx) -> String {
+    render_inlines(&para_inlines(p), ctx).trim().to_string()
 }
 
 /// 解析段落的编号来源：段落级 numPr 优先，样式级 numPr 兜底。
@@ -449,18 +644,42 @@ fn para_outline_level(p: &Node) -> Option<u32> {
         .filter(|&v| v <= 5) // 0-5 → 一至六级标题；9 表示正文
 }
 
-/// 表格 → Markdown 表格（单元格内的图片也会内联渲染）
-fn table_md(tbl: &Node, rels: &ImageRels, prefix: &str, extract_images: bool, used: &mut Vec<String>) -> String {
+/// 表格 → Markdown 表格。
+/// 处理合并单元格（gridSpan 橫向占列补空、vMerge 纵向合并续行留空）、
+/// 单元格多段落（<br> 连接）、单元格内图片与超链接。
+fn table_md(tbl: &Node, ctx: &mut Ctx) -> String {
     let mut rows: Vec<Vec<String>> = Vec::new();
     for tr in tbl.children().filter(|n| tag(n) == "tr") {
-        let mut cells = Vec::new();
+        let mut cells: Vec<String> = Vec::new();
         for tc in tr.children().filter(|n| tag(n) == "tc") {
-            // 单元格取第一个段落的内容；合并单元格可能产生空列
-            let text = tc.children()
-                .find(|n| tag(n) == "p")
-                .map(|p| para_text(&p, rels, prefix, extract_images, used).replace('|', "\\|"))
-                .unwrap_or_default();
-            cells.push(text);
+            let tcpr = tc.children().find(|n| tag(n) == "tcPr");
+            let grid_span: usize = tcpr
+                .and_then(|p| find_path(&p, &["gridSpan"]))
+                .and_then(|n| attr(&n, "val"))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            // vMerge：无 val 或 val="continue" 为续行（内容留空），"restart" 为合并起始
+            let is_vmerge_continue = tcpr
+                .and_then(|p| find_path(&p, &["vMerge"]))
+                .map(|n| !matches!(attr(&n, "val"), Some("restart")))
+                .unwrap_or(false);
+
+            // 单元格内所有段落，用 <br> 连接
+            let text = if is_vmerge_continue {
+                String::new()
+            } else {
+                tc.children()
+                    .filter(|n| tag(n) == "p")
+                    .map(|p| para_text(&p, ctx))
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("<br>")
+            };
+            cells.push(text.replace('|', "\\|"));
+            // 橫向合并占列：补空单元格
+            for _ in 1..grid_span {
+                cells.push(String::new());
+            }
         }
         rows.push(cells);
     }
@@ -499,9 +718,15 @@ fn convert_doc(
     let doc = Document::parse(document_xml).context("document.xml 解析失败")?;
     let styles = parse_styles(styles_xml);
     let numbering = parse_numbering(numbering_xml);
-    let (rels, _) = parse_rels(rels_xml);
+    let (rels, _, links) = parse_rels(rels_xml);
     let mut counters = CounterState::new(&numbering);
-    let mut used_images: Vec<String> = Vec::new();
+    let mut ctx = Ctx {
+        images: &rels,
+        links: &links,
+        image_prefix: &options.image_link_prefix,
+        extract_images: options.extract_images,
+        used_images: Vec::new(),
+    };
 
     let Some(body) = doc.descendants().find(|n| tag(n) == "body") else {
         bail!("document.xml 中没有 body");
@@ -511,14 +736,14 @@ fn convert_doc(
     for el in body.children().filter(|n| n.is_element()) {
         match tag(&el) {
             "tbl" => {
-                let t = table_md(&el, &rels, &options.image_link_prefix, options.extract_images, &mut used_images);
+                let t = table_md(&el, &mut ctx);
                 if !t.is_empty() {
                     md.push_str(&t);
                     md.push_str("\n\n");
                 }
             }
             "p" => {
-                let text = para_text(&el, &rels, &options.image_link_prefix, options.extract_images, &mut used_images);
+                let text = para_text(&el, &mut ctx);
                 if text.is_empty() {
                     continue;
                 }
@@ -568,7 +793,7 @@ fn convert_doc(
             _ => {}
         }
     }
-    Ok((md, used_images, rels))
+    Ok((md, ctx.used_images.clone(), rels))
 }
 
 /// 从 DOCX 字节流转换为 Markdown，并提取正文引用的图片数据
@@ -588,7 +813,7 @@ pub fn convert_bytes(bytes: &[u8], options: &ConvertOptions) -> Result<Conversio
     let styles_xml = read_entry("word/styles.xml").unwrap_or_default();
     let rels_xml = read_entry("word/_rels/document.xml.rels").unwrap_or_default();
 
-    let (_, file_to_zip) = parse_rels(&rels_xml);
+    let (_, file_to_zip, _) = parse_rels(&rels_xml);
     let (markdown, used_files, _) = convert_doc(&document_xml, &styles_xml, &numbering_xml, &rels_xml, options)?;
 
     // 只提取正文中实际引用的图片数据
@@ -662,6 +887,7 @@ mod tests {
         <Relationship Id="rId6" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image2.jpg"/>
         <Relationship Id="rId7" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="/word/media/image3.gif"/>
         <Relationship Id="rId8" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+        <Relationship Id="rId10" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://modao.cc/proto/xxx" TargetMode="External"/>
     </Relationships>"#;
 
     fn doc(body: &str) -> String {
@@ -800,6 +1026,133 @@ mod tests {
         assert!(r.markdown.contains("# 简介\n"), "{}", r.markdown);
         assert!(r.markdown.contains("## 文档目的\n"), "{}", r.markdown);
         assert!(!r.markdown.contains("# 1 简介"), "{}", r.markdown);
+    }
+
+    #[test]
+    fn hyperlink_external() {
+        let body = r#"<w:p><w:r><w:t>详见</w:t></w:r><w:hyperlink r:id="rId10"><w:r><w:t>原型地址</w:t></w:r></w:hyperlink><w:r><w:t>。</w:t></w:r></w:p>"#;
+        let r = convert(body);
+        assert!(r.markdown.contains("详见[原型地址](https://modao.cc/proto/xxx)。"), "{}", r.markdown);
+    }
+
+    #[test]
+    fn hyperlink_internal_anchor() {
+        let body = r#"<w:p><w:hyperlink w:anchor="chapter1"><w:r><w:t>跳转到第一章</w:t></w:r></w:hyperlink></w:p>"#;
+        let r = convert(body);
+        assert!(r.markdown.contains("[跳转到第一章](#chapter1)"), "{}", r.markdown);
+    }
+
+    #[test]
+    fn hyperlink_fld_simple() {
+        let body = r#"<w:p><w:fldSimple w:instr=" HYPERLINK &quot;https://example.com&quot; "><w:r><w:t>示例站点</w:t></w:r></w:fldSimple></w:p>"#;
+        let r = convert(body);
+        assert!(r.markdown.contains("[示例站点](https://example.com)"), "{}", r.markdown);
+    }
+
+    #[test]
+    fn inline_formatting() {
+        let body = r#"<w:p>
+            <w:r><w:rPr><w:b/></w:rPr><w:t>加粗</w:t></w:r>
+            <w:r><w:rPr><w:i/></w:rPr><w:t>斜体</w:t></w:r>
+            <w:r><w:rPr><w:b/><w:i/></w:rPr><w:t>加粗斜体</w:t></w:r>
+            <w:r><w:rPr><w:strike/></w:rPr><w:t>删除线</w:t></w:r>
+            <w:r><w:rPr><w:b w:val="false"/></w:rPr><w:t>不加粗</w:t></w:r>
+        </w:p>"#;
+        let r = convert(body);
+        assert!(r.markdown.contains("**加粗**"), "{}", r.markdown);
+        assert!(r.markdown.contains("*斜体*"), "{}", r.markdown);
+        assert!(r.markdown.contains("***加粗斜体***"), "{}", r.markdown);
+        assert!(r.markdown.contains("~~删除线~~"), "{}", r.markdown);
+        assert!(r.markdown.contains("不加粗"), "{}", r.markdown);
+        assert!(!r.markdown.contains("**不加粗**"), "{}", r.markdown);
+    }
+
+    #[test]
+    fn track_changes_accept_insert_reject_delete() {
+        let body = r#"<w:p><w:r><w:t>前</w:t></w:r><w:ins><w:r><w:t>插入</w:t></w:r></w:ins><w:del><w:r><w:delText>删除</w:delText></w:r></w:del><w:r><w:t>后</w:t></w:r></w:p>"#;
+        let r = convert(body);
+        assert!(r.markdown.contains("前插入后"), "{}", r.markdown);
+        assert!(!r.markdown.contains("删除"), "{}", r.markdown);
+    }
+
+    #[test]
+    fn alternate_content_no_duplicate_images() {
+        let body = r#"<w:p><mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">
+            <mc:Choice><w:drawing><wp:inline><wp:docPr name="图"/><a:blip r:embed="rId5"/></wp:inline></w:drawing></mc:Choice>
+            <mc:Fallback><w:pict><v:imagedata r:id="rId5"/></w:pict></mc:Fallback>
+        </mc:AlternateContent></w:p>"#;
+        let r = convert(body);
+        assert_eq!(r.markdown.matches("image1.png").count(), 1, "{}", r.markdown);
+    }
+
+    #[test]
+    fn table_grid_span_and_vmerge() {
+        let body = r#"<w:tbl>
+            <w:tr>
+                <w:tc><w:tcPr><gridSpan xmlns=""/><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>跨两列</w:t></w:r></w:p></w:tc>
+            </w:tr>
+            <w:tr>
+                <w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>纵合起始</w:t></w:r></w:p></w:tc>
+                <w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc>
+            </w:tr>
+            <w:tr>
+                <w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p><w:r><w:t>被吞掉</w:t></w:r></w:p></w:tc>
+                <w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc>
+            </w:tr>
+        </w:tbl>"#;
+        let r = convert(body);
+        assert!(r.markdown.contains("| 跨两列 |  |"), "{}", r.markdown);
+        assert!(r.markdown.contains("| 纵合起始 | A |"), "{}", r.markdown);
+        assert!(r.markdown.contains("|  | B |"), "{}", r.markdown);
+        assert!(!r.markdown.contains("被吞掉"), "{}", r.markdown);
+    }
+
+    #[test]
+    fn table_multi_paragraph_cell() {
+        let body = r#"<w:tbl><w:tr><w:tc>
+            <w:p><w:r><w:t>第一段</w:t></w:r></w:p>
+            <w:p><w:r><w:t>第二段</w:t></w:r></w:p>
+        </w:tc></w:tr></w:tbl>"#;
+        let r = convert(body);
+        assert!(r.markdown.contains("第一段<br>第二段"), "{}", r.markdown);
+    }
+
+    #[test]
+    fn adjacent_same_style_merged() {
+        // 相邻同格式 run 合并，不产生 `****` 断裂
+        let body = r#"<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>杭州海络</w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>信息技术</w:t></w:r></w:p>"#;
+        let r = convert(body);
+        assert!(r.markdown.contains("**杭州海络信息技术**"), "{}", r.markdown);
+        assert!(!r.markdown.contains("****"), "{}", r.markdown);
+    }
+
+    #[test]
+    fn complex_field_hyperlink() {
+        // fldChar begin/instrText/separate/end 序列 → [text](url)
+        let body = r#"<w:p>
+            <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+            <w:r><w:instrText> HYPERLINK &quot;https://example.com&quot; </w:instrText></w:r>
+            <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+            <w:r><w:t>显示文本</w:t></w:r>
+            <w:r><w:fldChar w:fldCharType="end"/></w:r>
+        </w:p>"#;
+        let r = convert(body);
+        assert!(r.markdown.contains("[显示文本](https://example.com)"), "{}", r.markdown);
+    }
+
+    #[test]
+    fn complex_field_internal_link_plain_text() {
+        // HYPERLINK \l _Toc 内部锚点：无 URL，保留显示文本不生成链接
+        let body = r#"<w:p>
+            <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+            <w:r><w:instrText> HYPERLINK \l _Toc123 </w:instrText></w:r>
+            <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+            <w:r><w:t>章节引用</w:t></w:r>
+            <w:r><w:fldChar w:fldCharType="end"/></w:r>
+        </w:p>"#;
+        let r = convert(body);
+        assert!(r.markdown.contains("章节引用"), "{}", r.markdown);
+        assert!(!r.markdown.contains("]("), "{}", r.markdown);
     }
 
     #[test]

@@ -1,0 +1,33 @@
+name: Publish to crates.io
+
+on:
+  push:
+    tags:
+      - 'v*'   # 推送 v0.1.0 这类 tag 时触发发布
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: 校验 tag 与 Cargo.toml 版本一致
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          echo "tag=$TAG package=$PKG"
+          [ "$TAG" = "$PKG" ] || { echo "::error::tag 与 Cargo.toml version 不一致"; exit 1; }
+
+      - name: 运行测试
+        run: cargo test --locked
+
+      - name: 打包校验（dry-run）
+        run: cargo publish --dry-run --locked
+
+      - name: 发布到 crates.io
+        run: cargo publish --locked --token ${{ secrets.CARGO_REGISTRY_TOKEN }}

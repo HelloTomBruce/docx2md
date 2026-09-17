@@ -32,11 +32,13 @@ pub struct ConvertOptions {
     pub extract_images: bool,
     /// 标题是否保留 Word 自动章节号（如 "# 1.1 文档目的"，默认 true；false 输出 "# 文档目的"）
     pub heading_numbers: bool,
+    /// 是否输出 YAML front matter（标题/作者/创建/修改时间，来自 docProps/core.xml，默认 false）
+    pub front_matter: bool,
 }
 
 impl ConvertOptions {
     pub fn new() -> Self {
-        Self { keep_toc: false, image_link_prefix: String::new(), extract_images: true, heading_numbers: true }
+        Self { keep_toc: false, image_link_prefix: String::new(), extract_images: true, heading_numbers: true, front_matter: false }
     }
 }
 
@@ -127,6 +129,12 @@ enum Inline {
     Styled { bold: bool, italic: bool, strike: bool, children: Vec<Inline> },
     /// 超链接：外部 URL 或文档内书签锚点
     Link { target: Option<String>, anchor: Option<String>, children: Vec<Inline> },
+    /// 脚注引用（w:footnoteReference）
+    FootnoteRef(String),
+    /// 尾注引用（w:endnoteReference）
+    EndnoteRef(String),
+    /// 数学公式（OMML → LaTeX）
+    Math(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -361,16 +369,143 @@ fn to_roman(mut n: u32) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// OMML 数学公式 → LaTeX
+// ---------------------------------------------------------------------------
+
+/// 递归提取 OMML 节点文本（m:r/m:t 内的 Unicode 数学字符）
+fn omml_text(node: &Node) -> String {
+    let mut out = String::new();
+    for n in node.descendants() {
+        if tag(&n) == "t" {
+            out.push_str(n.text().unwrap_or(""));
+        }
+    }
+    out
+}
+
+/// 找 m:oMath 子结构中的指定角色节点（如 m:num、m:den、m:e、m:sub、m:sup、m:deg、m:fName）
+fn omml_part<'a, 'b>(node: &'b Node<'a, 'a>, name: &str) -> Option<Node<'a, 'a>> {
+    node.children().find(|c| c.is_element() && tag(c) == name)
+}
+
+fn omml_to_latex(node: &Node) -> String {
+    let mut out = String::new();
+    for child in node.children().filter(|n| n.is_element()) {
+        out.push_str(&omml_node_latex(&child));
+    }
+    out
+}
+
+fn omml_node_latex(node: &Node) -> String {
+    match tag(node) {
+        // 分数 m:f = m:num / m:den
+        "f" => {
+            let num = omml_part(node, "num").map(|n| omml_to_latex(&n)).unwrap_or_default();
+            let den = omml_part(node, "den").map(|n| omml_to_latex(&n)).unwrap_or_default();
+            format!("\\frac{{{num}}}{{{den}}}")
+        }
+        // 上下标
+        "sSup" => {
+            let base = omml_part(node, "e").map(|n| omml_to_latex(&n)).unwrap_or_default();
+            let sup = omml_part(node, "sup").map(|n| omml_to_latex(&n)).unwrap_or_default();
+            format!("{base}^{{{sup}}}")
+        }
+        "sSub" => {
+            let base = omml_part(node, "e").map(|n| omml_to_latex(&n)).unwrap_or_default();
+            let sub = omml_part(node, "sub").map(|n| omml_to_latex(&n)).unwrap_or_default();
+            format!("{base}_{{{sub}}}")
+        }
+        "sSubSup" => {
+            let base = omml_part(node, "e").map(|n| omml_to_latex(&n)).unwrap_or_default();
+            let sub = omml_part(node, "sub").map(|n| omml_to_latex(&n)).unwrap_or_default();
+            let sup = omml_part(node, "sup").map(|n| omml_to_latex(&n)).unwrap_or_default();
+            format!("{base}_{{{sub}}}^{{{sup}}}")
+        }
+        // 根式 m:rad = m:deg + m:e
+        "rad" => {
+            let e = omml_part(node, "e").map(|n| omml_to_latex(&n)).unwrap_or_default();
+            match omml_part(node, "deg").map(|n| omml_to_latex(&n)) {
+                Some(deg) if !deg.is_empty() => format!("\\sqrt[{deg}]{{{e}}}"),
+                _ => format!("\\sqrt{{{e}}}"),
+            }
+        }
+        // 大型运算符 m:nary（求和/积分等）
+        "nary" => {
+            let chr = omml_part(node, "naryPr")
+                .and_then(|p| find_path(&p, &["chr"]))
+                .and_then(|n| attr(&n, "val"))
+                .unwrap_or("∑");
+            let op = match chr { "∑" => "\\sum", "∏" => "\\prod", "∫" => "\\int", c => return format!("{c}") , };
+            let sub = omml_part(node, "sub").map(|n| omml_to_latex(&n)).unwrap_or_default();
+            let sup = omml_part(node, "sup").map(|n| omml_to_latex(&n)).unwrap_or_default();
+            let e = omml_part(node, "e").map(|n| omml_to_latex(&n)).unwrap_or_default();
+            let mut s = op.to_string();
+            if !sub.is_empty() { s.push_str(&format!("_{{{sub}}}")); }
+            if !sup.is_empty() { s.push_str(&format!("^{{{sup}}}")); }
+            s.push_str(&format!(" {e}"));
+            s
+        }
+        // 定界符 m:d（括号）
+        "d" => {
+            let beg = omml_part(node, "dPr")
+                .and_then(|p| find_path(&p, &["begChr"]))
+                .and_then(|n| attr(&n, "val"))
+                .unwrap_or("(");
+            let end = omml_part(node, "dPr")
+                .and_then(|p| find_path(&p, &["endChr"]))
+                .and_then(|n| attr(&n, "val"))
+                .unwrap_or(")");
+            let e = omml_part(node, "e").map(|n| omml_to_latex(&n)).unwrap_or_default();
+            format!("{beg}{e}{end}")
+        }
+        // 函数 m:func = m:fName + m:e
+        "func" => {
+            let fname = omml_part(node, "fName").map(|n| omml_to_latex(&n)).unwrap_or_default();
+            let e = omml_part(node, "e").map(|n| omml_to_latex(&n)).unwrap_or_default();
+            format!("{fname} {e}")
+        }
+        // 矩阵 m:m，行 m:mr
+        "m" => {
+            let rows: Vec<String> = node.children()
+                .filter(|n| tag(n) == "mr")
+                .map(|r| r.children().filter(|c| tag(c) == "e")
+                    .map(|e| omml_to_latex(&e))
+                    .collect::<Vec<_>>().join(" & "))
+                .collect();
+            format!("\\begin{{matrix}} {} \\end{{matrix}}", rows.join(" \\\\ "))
+        }
+        // 普通结构角色节点：直接递归
+        "e" | "num" | "den" | "sub" | "sup" | "deg" | "fName" | "oMath" | "oMathPara" => omml_to_latex(node),
+        // 数学 run：直接取文本
+        "r" => omml_text(node),
+        _ => {
+            // 属性节点跳过，其余递归
+            if tag(node).ends_with("Pr") || tag(node) == "ctrlPr" {
+                String::new()
+            } else {
+                omml_to_latex(node)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 段落 / 表格提取（含图片、超链接、行内格式）
 // ---------------------------------------------------------------------------
+
 
 /// 转换上下文：渲染时需要的只读引用集合
 struct Ctx<'a> {
     images: &'a ImageRels,
     links: &'a LinkRels,
+    footnotes: &'a HashMap<String, Vec<Inline>>,
+    endnotes: &'a HashMap<String, Vec<Inline>>,
     image_prefix: &'a str,
     extract_images: bool,
     used_images: Vec<String>,
+    /// 引用顺序记录（脚注定义按首次引用顺序输出）
+    used_footnotes: Vec<String>,
+    used_endnotes: Vec<String>,
 }
 
 /// rPr 中的开/关属性（w:b、w:i 等）：存在且 val 不是 false/0/off 即为开
@@ -430,6 +565,22 @@ fn run_inline(r: &Node) -> Vec<Inline> {
                 }
             }
             "tab" | "br" | "cr" => children.push(Inline::Text(" ".into())),
+            "footnoteReference" => {
+                if let Some(id) = attr(&child, "id") {
+                    children.push(Inline::FootnoteRef(id.to_string()));
+                }
+            }
+            "endnoteReference" => {
+                if let Some(id) = attr(&child, "id") {
+                    children.push(Inline::EndnoteRef(id.to_string()));
+                }
+            }
+            "oMath" | "oMathPara" => {
+                let latex = omml_to_latex(&child);
+                if !latex.is_empty() {
+                    children.push(Inline::Math(latex));
+                }
+            }
             "drawing" | "pict" => {
                 if let Some(img) = image_from_container(&child) {
                     children.push(img);
@@ -549,6 +700,13 @@ fn walk_inlines<'a>(node: &Node<'a, 'a>, out: &mut Vec<Inline>) {
                     push_inline(out, img);
                 }
             }
+            // 数学公式：OMML → LaTeX
+            "oMath" | "oMathPara" => {
+                let latex = omml_to_latex(&child);
+                if !latex.is_empty() {
+                    push_inline(out, Inline::Math(latex));
+                }
+            }
             _ => walk_inlines(&child, out),
         }
     }
@@ -599,6 +757,26 @@ fn render_inlines(inlines: &[Inline], ctx: &mut Ctx) -> String {
                     Some(u) => text.push_str(&format!("[{inner}]({u})")),
                     None => text.push_str(&inner),
                 }
+            }
+            Inline::FootnoteRef(id) => {
+                if ctx.footnotes.contains_key(id) && !ctx.used_footnotes.contains(id) {
+                    ctx.used_footnotes.push(id.clone());
+                }
+                if ctx.footnotes.contains_key(id) {
+                    text.push_str(&format!("[^{id}]"));
+                }
+            }
+            Inline::EndnoteRef(id) => {
+                let label = format!("e{id}");
+                if ctx.endnotes.contains_key(id) && !ctx.used_endnotes.contains(id) {
+                    ctx.used_endnotes.push(id.clone());
+                }
+                if ctx.endnotes.contains_key(id) {
+                    text.push_str(&format!("[^{label}]"));
+                }
+            }
+            Inline::Math(latex) => {
+                text.push_str(&format!("${latex}$"));
             }
         }
     }
@@ -702,6 +880,73 @@ fn table_md(tbl: &Node, ctx: &mut Ctx) -> String {
     out.trim_end().to_string()
 }
 
+/// 解析 footnotes.xml / endnotes.xml：id → 内联内容。
+/// 跳过分隔符类条目（type="separator"/"continuationSeparator"/"continuationNotice"）。
+fn parse_notes(xml: &str, note_tag: &str) -> HashMap<String, Vec<Inline>> {
+    let mut map = HashMap::new();
+    let Ok(doc) = Document::parse(xml) else { return map };
+    for note in doc.descendants().filter(|n| tag(n) == note_tag) {
+        // 分隔符/续注符不输出
+        if let Some(t) = attr(&note, "type") {
+            if t != "normal" { continue; }
+        }
+        let Some(id) = attr(&note, "id") else { continue };
+        // 跳过内置保留 id（-1 分隔符、0 续注分隔符）
+        if id.starts_with('-') || id == "0" { continue; }
+        let mut inlines = Vec::new();
+        for p in note.children().filter(|n| tag(n) == "p") {
+            let mut pi = para_inlines(&p);
+            // 去掉脚注内容开头的 footnoteRef 标记
+            pi.retain(|i| !matches!(i, Inline::Text(t) if t.is_empty()));
+            inlines.extend(pi);
+            inlines.push(Inline::Text(" ".into())); // 多段落脚注以空格衔接
+        }
+        map.insert(id.to_string(), inlines);
+    }
+    map
+}
+
+/// 解析 docProps/core.xml → 键值对（用于 YAML front matter）
+fn parse_core_props(xml: &str) -> Vec<(&'static str, String)> {
+    let mut props = Vec::new();
+    let Ok(doc) = Document::parse(xml) else { return props };
+    for node in doc.descendants().filter(|n| n.is_element()) {
+        let key = match tag(&node) {
+            "title" => Some("title"),
+            "creator" => Some("author"),
+            "created" => Some("created"),
+            "modified" => Some("modified"),
+            "lastModifiedBy" => Some("last_modified_by"),
+            "subject" => Some("subject"),
+            _ => None,
+        };
+        if let Some(k) = key {
+            if let Some(v) = node.text() {
+                let v = v.trim();
+                if !v.is_empty() && !props.iter().any(|(ek, _)| *ek == k) {
+                    props.push((k, v.to_string()));
+                }
+            }
+        }
+    }
+    props
+}
+
+/// 渲染 YAML front matter
+fn render_front_matter(props: &[(&str, String)]) -> String {
+    if props.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("---\n");
+    for (k, v) in props {
+        // 含特殊字符的値用双引号包裹并转义
+        let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
+        out.push_str(&format!("{k}: \"{escaped}\"\n"));
+    }
+    out.push_str("---\n\n");
+    out
+}
+
 // ---------------------------------------------------------------------------
 // 主转换入口
 // ---------------------------------------------------------------------------
@@ -713,19 +958,28 @@ fn convert_doc(
     styles_xml: &str,
     numbering_xml: &str,
     rels_xml: &str,
+    footnotes_xml: &str,
+    endnotes_xml: &str,
+    core_xml: &str,
     options: &ConvertOptions,
 ) -> Result<(String, Vec<String>, ImageRels)> {
     let doc = Document::parse(document_xml).context("document.xml 解析失败")?;
     let styles = parse_styles(styles_xml);
     let numbering = parse_numbering(numbering_xml);
     let (rels, _, links) = parse_rels(rels_xml);
+    let footnotes = parse_notes(footnotes_xml, "footnote");
+    let endnotes = parse_notes(endnotes_xml, "endnote");
     let mut counters = CounterState::new(&numbering);
     let mut ctx = Ctx {
         images: &rels,
         links: &links,
+        footnotes: &footnotes,
+        endnotes: &endnotes,
         image_prefix: &options.image_link_prefix,
         extract_images: options.extract_images,
         used_images: Vec::new(),
+        used_footnotes: Vec::new(),
+        used_endnotes: Vec::new(),
     };
 
     let Some(body) = doc.descendants().find(|n| tag(n) == "body") else {
@@ -793,6 +1047,37 @@ fn convert_doc(
             _ => {}
         }
     }
+    // 追加脚注定义（按首次引用顺序）
+    let used_footnotes = ctx.used_footnotes.clone();
+    if !used_footnotes.is_empty() {
+        md.push('\n');
+        for id in &used_footnotes {
+            if let Some(content) = footnotes.get(id) {
+                let text = render_inlines(content, &mut ctx).trim().to_string();
+                md.push_str(&format!("[^{id}]: {text}\n"));
+            }
+        }
+    }
+    // 追加尾注定义
+    let used_endnotes = ctx.used_endnotes.clone();
+    if !used_endnotes.is_empty() {
+        md.push('\n');
+        for id in &used_endnotes {
+            if let Some(content) = endnotes.get(id) {
+                let text = render_inlines(content, &mut ctx).trim().to_string();
+                md.push_str(&format!("[^e{id}]: {text}\n"));
+            }
+        }
+    }
+
+    // YAML front matter 前置
+    if options.front_matter {
+        let fm = render_front_matter(&parse_core_props(core_xml));
+        if !fm.is_empty() {
+            md = format!("{fm}{md}");
+        }
+    }
+
     Ok((md, ctx.used_images.clone(), rels))
 }
 
@@ -812,9 +1097,12 @@ pub fn convert_bytes(bytes: &[u8], options: &ConvertOptions) -> Result<Conversio
     let numbering_xml = read_entry("word/numbering.xml").unwrap_or_default();
     let styles_xml = read_entry("word/styles.xml").unwrap_or_default();
     let rels_xml = read_entry("word/_rels/document.xml.rels").unwrap_or_default();
+    let footnotes_xml = read_entry("word/footnotes.xml").unwrap_or_default();
+    let endnotes_xml = read_entry("word/endnotes.xml").unwrap_or_default();
+    let core_xml = read_entry("docProps/core.xml").unwrap_or_default();
 
     let (_, file_to_zip, _) = parse_rels(&rels_xml);
-    let (markdown, used_files, _) = convert_doc(&document_xml, &styles_xml, &numbering_xml, &rels_xml, options)?;
+    let (markdown, used_files, _) = convert_doc(&document_xml, &styles_xml, &numbering_xml, &rels_xml, &footnotes_xml, &endnotes_xml, &core_xml, options)?;
 
     // 只提取正文中实际引用的图片数据
     let mut images = Vec::new();
@@ -842,9 +1130,15 @@ pub fn convert_file(path: impl AsRef<Path>, options: &ConvertOptions) -> Result<
     convert_bytes(&bytes, options)
 }
 
-/// 从解析好的 XML 字符串转换（便于测试；图片数据为空）
+/// 从解析好的 XML 字符串转换（便于测试；图片数据为空，无脚注/元数据）
 pub fn convert_xml(document_xml: &str, styles_xml: &str, numbering_xml: &str, rels_xml: &str, options: &ConvertOptions) -> Result<ConversionResult> {
-    let (markdown, used_files, _) = convert_doc(document_xml, styles_xml, numbering_xml, rels_xml, options)?;
+    convert_xml_full(document_xml, styles_xml, numbering_xml, rels_xml, "", "", "", options)
+}
+
+/// 从解析好的 XML 字符串转换，包含脚注/尾注/元数据（便于测试；图片数据为空）
+#[allow(clippy::too_many_arguments)]
+pub fn convert_xml_full(document_xml: &str, styles_xml: &str, numbering_xml: &str, rels_xml: &str, footnotes_xml: &str, endnotes_xml: &str, core_xml: &str, options: &ConvertOptions) -> Result<ConversionResult> {
+    let (markdown, used_files, _) = convert_doc(document_xml, styles_xml, numbering_xml, rels_xml, footnotes_xml, endnotes_xml, core_xml, options)?;
     let images = used_files.into_iter()
         .map(|file_name| ExtractedImage { file_name, data: Vec::new() })
         .collect();
@@ -1153,6 +1447,69 @@ mod tests {
         let r = convert(body);
         assert!(r.markdown.contains("章节引用"), "{}", r.markdown);
         assert!(!r.markdown.contains("]("), "{}", r.markdown);
+    }
+
+    #[test]
+    fn footnote_ref_and_definition() {
+        let body = r#"<w:p><w:r><w:t>正文</w:t></w:r><w:r><w:footnoteReference w:id="2"/></w:r></w:p>"#;
+        let footnotes = r#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:footnote w:type="separator" w:id="-1"/>
+            <w:footnote w:type="continuationSeparator" w:id="0"/>
+            <w:footnote w:id="2"><w:p><w:r><w:t>这是脚注内容</w:t></w:r></w:p></w:footnote>
+        </w:footnotes>"#;
+        let r = convert_xml_full(&doc(body), STYLES, NUMBERING, RELS, footnotes, "", "", &ConvertOptions::new()).unwrap();
+        assert!(r.markdown.contains("正文[^2]"), "{}", r.markdown);
+        assert!(r.markdown.contains("[^2]: 这是脚注内容"), "{}", r.markdown);
+        assert!(!r.markdown.contains("[^-1]"), "{}", r.markdown);
+    }
+
+    #[test]
+    fn endnote_ref_and_definition() {
+        let body = r#"<w:p><w:r><w:t>引用</w:t></w:r><w:r><w:endnoteReference w:id="3"/></w:r></w:p>"#;
+        let endnotes = r#"<w:endnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:endnote w:id="3"><w:p><w:r><w:t>尾注说明</w:t></w:r></w:p></w:endnote>
+        </w:endnotes>"#;
+        let r = convert_xml_full(&doc(body), STYLES, NUMBERING, RELS, "", endnotes, "", &ConvertOptions::new()).unwrap();
+        assert!(r.markdown.contains("引用[^e3]"), "{}", r.markdown);
+        assert!(r.markdown.contains("[^e3]: 尾注说明"), "{}", r.markdown);
+    }
+
+    #[test]
+    fn front_matter_from_core_props() {
+        let body = p("正文内容");
+        let core = r#"<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/">
+            <dc:title>需求文档</dc:title><dc:creator>张三</dc:creator>
+            <dcterms:created>2026-06-23T08:00:00Z</dcterms:created>
+        </cp:coreProperties>"#;
+        let r = convert_xml_full(&doc(&body), STYLES, NUMBERING, RELS, "", "", core, &ConvertOptions {
+            front_matter: true,
+            ..ConvertOptions::new()
+        }).unwrap();
+        assert!(r.markdown.starts_with("---\ntitle: \"需求文档\"\nauthor: \"张三\""), "{}", r.markdown);
+        assert!(r.markdown.contains("created: \"2026-06-23T08:00:00Z\""), "{}", r.markdown);
+    }
+
+    #[test]
+    fn omml_fraction_and_superscript() {
+        // x 的平方分之一：m:f(m:num=1, m:den=m:sSup(x,2))
+        let body = r#"<w:p><m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+            <m:f><m:num><m:r><m:t>1</m:t></m:r></m:num>
+            <m:den><m:sSup><m:e><m:r><m:t>x</m:t></m:r></m:e><m:sup><m:r><m:t>2</m:t></m:r></m:sup></m:sSup></m:den>
+            </m:f></m:oMath></w:p>"#;
+        let r = convert(body);
+        assert!(r.markdown.contains("$\\frac{1}{x^{2}}$"), "{}", r.markdown);
+    }
+
+    #[test]
+    fn omml_nary_sum() {
+        let body = r#"<w:p><m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+            <m:nary><m:naryPr><m:chr m:val="∑"/></m:naryPr>
+            <m:sub><m:r><m:t>i=1</m:t></m:r></m:sub>
+            <m:sup><m:r><m:t>n</m:t></m:r></m:sup>
+            <m:e><m:r><m:t>i</m:t></m:r></m:e>
+            </m:nary></m:oMath></w:p>"#;
+        let r = convert(body);
+        assert!(r.markdown.contains("$\\sum_{i=1}^{n} i$"), "{}", r.markdown);
     }
 
     #[test]

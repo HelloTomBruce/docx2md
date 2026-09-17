@@ -29,6 +29,10 @@ struct Cli {
     #[arg(long)]
     no_heading_numbers: bool,
 
+    /// 输出 YAML front matter（标题/作者/时间，来自文档属性）
+    #[arg(long)]
+    front_matter: bool,
+
     /// 保留 TOC 目录段落（默认跳过）
     #[arg(long)]
     keep_toc: bool,
@@ -64,6 +68,7 @@ fn main() -> Result<()> {
         image_link_prefix,
         extract_images: !cli.no_images,
         heading_numbers: !cli.no_heading_numbers,
+        front_matter: cli.front_matter,
     };
     let result = docx2md::convert_file(&cli.input, &options)
         .with_context(|| format!("转换失败: {}", cli.input.display()))?;

@@ -34,11 +34,13 @@ pub struct ConvertOptions {
     pub heading_numbers: bool,
     /// 是否输出 YAML front matter（标题/作者/创建/修改时间，来自 docProps/core.xml，默认 false）
     pub front_matter: bool,
+    /// 图片是否输出为带尺寸的 HTML img 标签（尺寸来自 wp:extent，EMU 转 px；默认 false 输出标准 Markdown 图片）
+    pub image_size: bool,
 }
 
 impl ConvertOptions {
     pub fn new() -> Self {
-        Self { keep_toc: false, image_link_prefix: String::new(), extract_images: true, heading_numbers: true, front_matter: false }
+        Self { keep_toc: false, image_link_prefix: String::new(), extract_images: true, heading_numbers: true, front_matter: false, image_size: false }
     }
 }
 
@@ -102,6 +104,8 @@ struct StyleInfo {
 struct Numbering {
     num_to_abs: HashMap<String, String>,
     abstracts: HashMap<String, HashMap<u32, LvlDef>>,
+    /// numId → ilvl → (覆盖的 lvl 定义, 起始值覆盖)
+    overrides: HashMap<String, HashMap<u32, (Option<LvlDef>, Option<u32>)>>,
 }
 
 #[derive(Debug, Default)]
@@ -124,7 +128,7 @@ type LinkRels = HashMap<String, String>;
 #[derive(Debug)]
 enum Inline {
     Text(String),
-    Image { r_id: String, alt: String },
+    Image { r_id: String, alt: String, width: Option<u32> },
     /// 行内格式：加粗/斜体/删除线
     Styled { bold: bool, italic: bool, strike: bool, children: Vec<Inline> },
     /// 超链接：外部 URL 或文档内书签锚点
@@ -173,11 +177,20 @@ fn parse_numbering(xml: &str) -> Numbering {
     let Ok(doc) = Document::parse(xml) else { return numbering };
 
     for num in doc.descendants().filter(|n| tag(n) == "num") {
-        if let (Some(id), Some(abs)) = (
-            attr(&num, "numId"),
-            find_path(&num, &["abstractNumId"]).and_then(|n| attr(&n, "val")),
-        ) {
-            numbering.num_to_abs.insert(id.to_string(), abs.to_string());
+        let Some(num_id) = attr(&num, "numId") else { continue };
+        if let Some(abs) = find_path(&num, &["abstractNumId"]).and_then(|n| attr(&n, "val")) {
+            numbering.num_to_abs.insert(num_id.to_string(), abs.to_string());
+        }
+        // w:lvlOverride：num 级局部覆盖某级的格式或起始值
+        for ov in num.children().filter(|n| tag(n) == "lvlOverride") {
+            let ilvl: u32 = attr(&ov, "ilvl").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let start_override = find_path(&ov, &["startOverride"]).and_then(|n| attr(&n, "val")).and_then(|v| v.parse().ok());
+            let lvl_override = ov.children().find(|n| tag(n) == "lvl").map(|lvl| LvlDef {
+                fmt: find_path(&lvl, &["numFmt"]).and_then(|n| attr(&n, "val")).unwrap_or("decimal").to_string(),
+                text: find_path(&lvl, &["lvlText"]).and_then(|n| attr(&n, "val")).unwrap_or("%1.").to_string(),
+                start: find_path(&lvl, &["start"]).and_then(|n| attr(&n, "val")).and_then(|v| v.parse().ok()).unwrap_or(1),
+            });
+            numbering.overrides.entry(num_id.to_string()).or_default().insert(ilvl, (lvl_override, start_override));
         }
     }
     for abs in doc.descendants().filter(|n| tag(n) == "abstractNum") {
@@ -295,11 +308,17 @@ impl<'a> CounterState<'a> {
         };
         let empty = HashMap::new();
         let lvls = self.numbering.abstracts.get(abs_id).unwrap_or(&empty);
-        let lvl = lvls.get(&ilvl).cloned().unwrap_or_default();
+        let mut lvl = lvls.get(&ilvl).cloned().unwrap_or_default();
+        let mut start = lvl.start;
+        // 应用 num 级 lvlOverride / startOverride
+        if let Some(ov) = self.numbering.overrides.get(num_id).and_then(|m| m.get(&ilvl)) {
+            if let Some(l) = &ov.0 { lvl = l.clone(); }
+            if let Some(s) = ov.1 { start = s; }
+        }
 
         let cnt = self.counters.entry(num_id.to_string()).or_default();
         // 推进本层
-        *cnt.entry(ilvl).or_insert(lvl.start.saturating_sub(1)) += 1;
+        *cnt.entry(ilvl).or_insert(start.saturating_sub(1)) += 1;
         // 重置更深层
         cnt.retain(|k, _| *k <= ilvl);
         // 未走过的上层补 start
@@ -502,6 +521,7 @@ struct Ctx<'a> {
     endnotes: &'a HashMap<String, Vec<Inline>>,
     image_prefix: &'a str,
     extract_images: bool,
+    image_size: bool,
     used_images: Vec<String>,
     /// 引用顺序记录（脚注定义按首次引用顺序输出）
     used_footnotes: Vec<String>,
@@ -516,10 +536,11 @@ fn is_on(el: Option<Node>) -> bool {
     }
 }
 
-/// 从 drawing/pict 容器中提取图片（docPr 的 descr/name 作为 alt）
+/// 从 drawing/pict 容器中提取图片（docPr 的 descr/name 作为 alt，wp:extent 提取宽度）
 fn image_from_container(container: &Node) -> Option<Inline> {
     let mut alt = String::new();
     let mut r_id: Option<String> = None;
+    let mut width: Option<u32> = None;
     for node in container.descendants() {
         match tag(&node) {
             "inline" | "anchor" => alt.clear(),
@@ -527,6 +548,15 @@ fn image_from_container(container: &Node) -> Option<Inline> {
                 alt = attr(&node, "descr").filter(|s| !s.is_empty())
                     .or_else(|| attr(&node, "name"))
                     .unwrap_or("").to_string();
+            }
+            // wp:extent 的 cx 单位是 EMU（1px = 9525 EMU）
+            "extent" => {
+                if width.is_none() {
+                    width = attr(&node, "cx")
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .map(|cx| (cx / 9525) as u32)
+                        .filter(|&w| w > 0);
+                }
             }
             "blip" => {
                 if r_id.is_none() {
@@ -541,7 +571,20 @@ fn image_from_container(container: &Node) -> Option<Inline> {
             _ => {}
         }
     }
-    r_id.map(|r_id| Inline::Image { r_id, alt })
+    r_id.map(|r_id| Inline::Image { r_id, alt, width })
+}
+
+/// 提取文本框（w:txbxContent）中的内联内容，段落间以空格衔接
+fn textbox_inlines(container: &Node, out: &mut Vec<Inline>) {
+    for txbx in container.descendants().filter(|n| tag(n) == "txbxContent") {
+        for p in txbx.children().filter(|n| tag(n) == "p") {
+            let before = out.len();
+            walk_inlines(&p, out);
+            if out.len() > before {
+                out.push(Inline::Text(" ".into()));
+            }
+        }
+    }
 }
 
 /// 提取 run（w:r）内容：解析 rPr 行内格式 + 子内容
@@ -585,6 +628,8 @@ fn run_inline(r: &Node) -> Vec<Inline> {
                 if let Some(img) = image_from_container(&child) {
                     children.push(img);
                 }
+                // 形状/图文框内的文本框内容
+                textbox_inlines(&child, &mut children);
             }
             _ => {}
         }
@@ -694,11 +739,12 @@ fn walk_inlines<'a>(node: &Node<'a, 'a>, out: &mut Vec<Inline>) {
                 }
             }
             "Fallback" => {}
-            // 图片容器直接出现在段落层（少数情况）
+            // 图片容器直接出现在段落层（少数情况）；同时提取形状内文本框
             "drawing" | "pict" => {
                 if let Some(img) = image_from_container(&child) {
                     push_inline(out, img);
                 }
+                textbox_inlines(&child, out);
             }
             // 数学公式：OMML → LaTeX
             "oMath" | "oMathPara" => {
@@ -726,12 +772,15 @@ fn render_inlines(inlines: &[Inline], ctx: &mut Ctx) -> String {
     for item in inlines {
         match item {
             Inline::Text(t) => text.push_str(t),
-            Inline::Image { r_id, alt } if ctx.extract_images => {
+            Inline::Image { r_id, alt, width } if ctx.extract_images => {
                 if let Some(file_name) = ctx.images.get(r_id) {
                     if !ctx.used_images.contains(file_name) {
                         ctx.used_images.push(file_name.clone());
                     }
-                    text.push_str(&format!("![{alt}]({}{file_name})", ctx.image_prefix));
+                    match (ctx.image_size, width) {
+                        (true, Some(w)) => text.push_str(&format!("<img src=\"{}{file_name}\" alt=\"{alt}\" width=\"{w}\" />", ctx.image_prefix)),
+                        _ => text.push_str(&format!("![{alt}]({}{file_name})", ctx.image_prefix)),
+                    }
                 }
             }
             Inline::Image { .. } => {}
@@ -824,8 +873,8 @@ fn para_outline_level(p: &Node) -> Option<u32> {
 
 /// 表格 → Markdown 表格。
 /// 处理合并单元格（gridSpan 橫向占列补空、vMerge 纵向合并续行留空）、
-/// 单元格多段落（<br> 连接）、单元格内图片与超链接。
-fn table_md(tbl: &Node, ctx: &mut Ctx) -> String {
+/// 单元格多段落（<br> 连接）、单元格内图片、超链接与列表（段落以列表标记前缀）。
+fn table_md(tbl: &Node, ctx: &mut Ctx, styles: &Styles, counters: &mut CounterState) -> String {
     let mut rows: Vec<Vec<String>> = Vec::new();
     for tr in tbl.children().filter(|n| tag(n) == "tr") {
         let mut cells: Vec<String> = Vec::new();
@@ -842,13 +891,27 @@ fn table_md(tbl: &Node, ctx: &mut Ctx) -> String {
                 .map(|n| !matches!(attr(&n, "val"), Some("restart")))
                 .unwrap_or(false);
 
-            // 单元格内所有段落，用 <br> 连接
+            // 单元格内所有段落，用 <br> 连接；带编号的段落还原列表标记
             let text = if is_vmerge_continue {
                 String::new()
             } else {
                 tc.children()
                     .filter(|n| tag(n) == "p")
-                    .map(|p| para_text(&p, ctx))
+                    .map(|p| {
+                        let t = para_text(&p, ctx);
+                        if t.is_empty() {
+                            return t;
+                        }
+                        let (num_id, ilvl, _sid) = para_numpr(&p, styles);
+                        match num_id {
+                            Some(nid) => {
+                                let (is_bullet, numtext) = counters.resolve(&nid, ilvl);
+                                let marker = if is_bullet { "- ".to_string() } else { format!("{numtext} ") };
+                                format!("{marker}{t}")
+                            }
+                            None => t,
+                        }
+                    })
                     .filter(|t| !t.is_empty())
                     .collect::<Vec<_>>()
                     .join("<br>")
@@ -977,6 +1040,7 @@ fn convert_doc(
         endnotes: &endnotes,
         image_prefix: &options.image_link_prefix,
         extract_images: options.extract_images,
+        image_size: options.image_size,
         used_images: Vec::new(),
         used_footnotes: Vec::new(),
         used_endnotes: Vec::new(),
@@ -990,7 +1054,7 @@ fn convert_doc(
     for el in body.children().filter(|n| n.is_element()) {
         match tag(&el) {
             "tbl" => {
-                let t = table_md(&el, &mut ctx);
+                let t = table_md(&el, &mut ctx, &styles, &mut counters);
                 if !t.is_empty() {
                     md.push_str(&t);
                     md.push_str("\n\n");
@@ -1510,6 +1574,48 @@ mod tests {
             </m:nary></m:oMath></w:p>"#;
         let r = convert(body);
         assert!(r.markdown.contains("$\\sum_{i=1}^{n} i$"), "{}", r.markdown);
+    }
+
+    #[test]
+    fn image_size_html_output() {
+        let body = r#"<w:p><w:r><w:drawing><wp:inline><wp:extent cx="1905000" cy="952500"/><wp:docPr name="截图"/><a:blip r:embed="rId5"/></wp:inline></w:drawing></w:r></w:p>"#;
+        let r = convert_xml(&doc(body), STYLES, NUMBERING, RELS, &ConvertOptions {
+            image_link_prefix: "img/".into(),
+            image_size: true,
+            ..ConvertOptions::new()
+        }).unwrap();
+        assert!(r.markdown.contains("<img src=\"img/image1.png\" alt=\"截图\" width=\"200\" />"), "{}", r.markdown);
+    }
+
+    #[test]
+    fn textbox_content_extracted() {
+        let body = r#"<w:p><w:r><w:pict><v:shape><v:textbox><w:txbxContent>
+            <w:p><w:r><w:t>文本框第一段</w:t></w:r></w:p>
+            <w:p><w:r><w:t>文本框第二段</w:t></w:r></w:p>
+        </w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>"#;
+        let r = convert(body);
+        assert!(r.markdown.contains("文本框第一段"), "{}", r.markdown);
+        assert!(r.markdown.contains("文本框第二段"), "{}", r.markdown);
+    }
+
+    #[test]
+    fn lvl_override_start() {
+        // numId=4 通过 startOverride 从 5 开始编号
+        let numbering = r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:abstractNum w:abstractNumId="9"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum>
+            <w:num w:numId="4"><w:abstractNumId w:val="9"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="5"/></w:lvlOverride></w:num>
+        </w:numbering>"#;
+        let body = format!("{}{}", p_num("第五项", 4, 0), p_num("第六项", 4, 0));
+        let r = convert_xml(&doc(&body), STYLES, numbering, RELS, &ConvertOptions::new()).unwrap();
+        assert!(r.markdown.contains("5. 第五项"), "{}", r.markdown);
+        assert!(r.markdown.contains("6. 第六项"), "{}", r.markdown);
+    }
+
+    #[test]
+    fn list_inside_table_cell() {
+        let body = format!(r#"<w:tbl><w:tr><w:tc>{}</w:tc></w:tr></w:tbl>"#, p_num("单元格内列表项", 2, 0));
+        let r = convert(&body);
+        assert!(r.markdown.contains("- 单元格内列表项"), "{}", r.markdown);
     }
 
     #[test]

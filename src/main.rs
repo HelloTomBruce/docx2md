@@ -33,6 +33,10 @@ struct Cli {
     #[arg(long)]
     front_matter: bool,
 
+    /// 图片输出为带尺寸的 HTML img 标签（保留 Word 中的显示宽度）
+    #[arg(long)]
+    image_size: bool,
+
     /// 保留 TOC 目录段落（默认跳过）
     #[arg(long)]
     keep_toc: bool,
@@ -69,6 +73,7 @@ fn main() -> Result<()> {
         extract_images: !cli.no_images,
         heading_numbers: !cli.no_heading_numbers,
         front_matter: cli.front_matter,
+        image_size: cli.image_size,
     };
     let result = docx2md::convert_file(&cli.input, &options)
         .with_context(|| format!("转换失败: {}", cli.input.display()))?;

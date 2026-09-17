@@ -16,6 +16,10 @@
 - **脚注/尾注**：`w:footnoteReference`/`w:endnoteReference` → `[^N]` / `[^eN]`，定义按首次引用顺序追加文末；分隔符类条目自动跳过
 - **数学公式**：OMML → LaTeX（`m:f` 分数、上下标、根式、n-ary 运算符、定界符、函数、矩阵），输出 `$...$`
 - **文档元数据**：`docProps/core.xml` → YAML front matter（`--front-matter`，含 title/author/created/modified）
+- **图片尺寸**：`--image-size` 输出 `<img width>` 保留 Word 显示宽度（`wp:extent`，EMU→px）
+- **文本框**：`w:txbxContent` 形状/图文框内文本提取
+- **表格内列表**：单元格内带编号段落还原 `-`/`1.` 标记
+- **编号覆盖**：`w:lvlOverride` / `w:startOverride`（局部格式覆盖与起始值重启）
 - **修订**：track changes 默认接受插入（`w:ins`）、拒绝删除（`w:del`）
 - **边界情况**：段落级 numPr 优先、样式级 numPr 兜底、`numId=0` 表示取消编号
 
@@ -49,6 +53,9 @@ docx2md 需求文档.docx -o output.md --no-images
 # 输出 YAML front matter（文档属性元数据）
 docx2md 需求文档.docx --front-matter -o output.md
 
+# 图片保留 Word 显示宽度（HTML img 标签）
+docx2md 需求文档.docx --image-size -o output.md
+
 # 保留 TOC 目录（默认跳过）
 docx2md 需求文档.docx --keep-toc -o output.md
 ```
@@ -67,12 +74,27 @@ std::fs::write("output.md", &result.markdown)?;
 result.write_images("output.media")?;  // 导出图片文件
 ```
 
+## 与同类工具对比
+
+| 能力 | docx2md | pandoc | mammoth | anytomd |
+|---|---|---|---|---|
+| 形态 | Rust 库 + CLI，零外部依赖 | 外部二进制 | JS/Python 库 | Rust 库 |
+| 多级编号列表（numbering.xml） | ✅ 完整（含 lvlOverride/startOverride） | ✅ | ⚠️ 部分 | ❌ |
+| 标题自动章节号 | ✅ 可选保留/去除 | ✅ 保留 | ❌ | ❌ |
+| 合并单元格 / 多段单元格 | ✅ | ✅ | ⚠️ 弱 | ⚠️ |
+| 图片内联导出 + alt + 尺寸 | ✅ | ✅ | ✅ | ⚠️ base64 混杂 |
+| 超链接（含域代码形式） | ✅ | ✅ | ✅ | ❌ |
+| 脚注/尾注 | ✅ | ✅ | ✅ | ❌ |
+| OMML 公式 → LaTeX | ✅ | ✅ | ❌ | ❌ |
+| 修订处理（接受/拒绝） | ✅ | ✅ | ❌ | ❌ |
+| YAML front matter | ✅ | ✅ | ❌ | ❌ |
+| 可嵌入（Tauri/MCP/CLI 管道） | ✅ | ❌ 需安装 | ⚠️ | ✅ |
+
 ## 已知限制
 
 - 页眉/页脚中的图片不提取（它们有自己的 rels 文件）
 - 纯文本 URL 不自动转为链接（GFM 渲染器通常会自动识别）
-- 表格内的列表标记不还原（单元格多段落以 `<br>` 连接）
-- `lvlOverride`（局部覆盖某级编号格式）未处理
+- 单元格内嵌套表格不递归
 - 样式级行内格式（如 Hyperlink 字符样式的下划线）不渲染
 
 ## 开发

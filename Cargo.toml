@@ -1,0 +1,20 @@
+[package]
+name = "docx2md"
+version = "0.1.0"
+edition = "2021"
+description = "Style-driven DOCX to Markdown converter with accurate list/heading numbering restoration"
+license = "MIT"
+
+[dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
+roxmltree = "0.20"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[lib]
+name = "docx2md"
+path = "src/lib.rs"
+
+[[bin]]
+name = "docx2md"
+path = "src/main.rs"

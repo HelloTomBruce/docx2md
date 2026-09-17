@@ -8,6 +8,9 @@
 - **列表（ul/ol）**：完整解析 `numbering.xml` 三层引用（段落 `numPr(numId, ilvl)` → `w:num` → `w:abstractNum` 的 `lvl`），准确还原嵌套层级与编号
 - **自动编号**：计数器状态机渲染 `lvlText` 中的 `%1-%9`，支持多级编号（`1.1.2`）、`(1)`、`①`、罗马数字、中文数字等 `numFmt`
 - **表格**：`w:tbl` → Markdown 表格
+- **图片**：按文档顺序内联提取（DrawingML `a:blip r:embed` / 旧式 VML `v:imagedata r:id`），
+  经 `document.xml.rels` 映射到 `word/media/*`，导出文件并生成 `![alt](prefix/file.png)`；
+  alt 取 `wp:docPr` 的 descr/name；同一文件多次引用自动去重；支持表格单元格内图片
 - **边界情况**：段落级 numPr 优先、样式级 numPr 兜底、`numId=0` 表示取消编号
 
 ## 安装
@@ -26,10 +29,16 @@ docx2md = { git = "ssh://git@your-git-server/docx2md.git" }
 
 ```bash
 # 输出到 stdout
-docx2md 需求文档.docx
+ docx2md 需求文档.docx
 
-# 输出到文件
+# 输出到文件（图片默认导出到 output.media/，md 中自动引用）
 docx2md 需求文档.docx -o output.md
+
+# 自定义图片目录 / 链接前缀
+docx2md 需求文档.docx -o output.md --images-dir assets/img --image-prefix "assets/img/"
+
+# 不导出图片（md 中也不生成图片链接）
+docx2md 需求文档.docx -o output.md --no-images
 
 # 保留 TOC 目录（默认跳过）
 docx2md 需求文档.docx --keep-toc -o output.md
@@ -40,14 +49,19 @@ docx2md 需求文档.docx --keep-toc -o output.md
 ```rust
 use docx2md::{convert_file, ConvertOptions};
 
-let md = convert_file("需求文档.docx", &ConvertOptions::default())?;
-println!("{md}");
+let options = ConvertOptions {
+    image_link_prefix: "output.media/".into(),
+    ..ConvertOptions::new()
+};
+let result = convert_file("需求文档.docx", &options)?;
+std::fs::write("output.md", &result.markdown)?;
+result.write_images("output.media")?;  // 导出图片文件
 ```
 
 ## 已知限制
 
-- 图片不导出（`word/media/*` 未处理）
-- 表格单元格内的列表标记会丢失
+- 页眉/页脚中的图片不提取（它们有自己的 rels 文件）
+- 表格单元格内只取第一个段落的内容
 - `lvlOverride`（局部覆盖某级编号格式）未处理
 - 合并单元格会产生空列
 
